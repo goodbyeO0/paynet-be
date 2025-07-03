@@ -1,0 +1,32 @@
+{
+    "name": "cross-border-payment-system",
+    "version": "1.0.0",
+    "description": "Cross-border payment system using smart contracts for Thailand-Malaysia transfers",
+    "main": "main.js",
+    "scripts": {
+        "start": "node main.js",
+        "dev": "nodemon main.js",
+        "test": "node test.js"
+    },
+    "dependencies": {
+        "axios": "^1.5.0",
+        "cors": "^2.8.5",
+        "crypto": "^1.0.1",
+        "dotenv": "^16.3.1",
+        "ethers": "^6.15.0",
+        "express": "^5.1.0"
+    },
+    "devDependencies": {
+        "nodemon": "^3.0.1"
+    },
+    "keywords": [
+        "blockchain",
+        "smart-contracts",
+        "cross-border-payments",
+        "thailand",
+        "malaysia",
+        "qr-payments"
+    ],
+    "author": "Your Name",
+    "license": "MIT"
+}
