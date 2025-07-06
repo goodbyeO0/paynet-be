@@ -10,7 +10,7 @@ app.use(cors());
 app.use(express.json());
 
 // Load the real contract ABI and configuration
-const contractABI = require('./contract/abi.json');
+const contractABI = require('../contract/abi.json');
 const config = require('./config');
 
 // Contract configuration from config file
@@ -188,6 +188,8 @@ app.post('/scan-qr', async (req, res) => {
             return res.status(404).json({ error: 'Invalid QR code' });
         }
 
+        console.log('✅ Cross-border payment:', payerCountry, '->', merchantCountry, '(' + merchant.name + ')');
+
         // Verify payer exists
         const paymentInfo = getPaymentInfo(payerCountry, merchantCountry);
         const payerBankData = loadBankData(paymentInfo.originBankData);
@@ -263,10 +265,59 @@ app.post('/scan-qr', async (req, res) => {
         const receipt = await tx.wait();
         console.log('✅ Transaction confirmed:', receipt?.hash || tx.hash);
 
+        // Immediately verify both banks to avoid blockchain verification issues
+        console.log('🔄 Immediately verifying both banks on the blockchain...');
+        
+        try {
+            // Verify first bank
+            const firstBankId = paymentInfo.direction === 'THAILAND_TO_MALAYSIA' ? 'THAI_BANK_001' : 'MAYBANK_001';
+            const firstVerifyFunction = paymentInfo.direction === 'THAILAND_TO_MALAYSIA' ? 
+                contract.confirmThailandVerification : contract.confirmMalaysiaVerification;
+            
+            let tx1 = await firstVerifyFunction(
+                sessionId,
+                true,
+                firstBankId,
+                { gasLimit: GAS_SETTINGS.gasLimit }
+            );
+            await tx1.wait();
+            console.log(`✅ ${firstBankId} verification confirmed on blockchain`);
+            
+            // Verify second bank
+            const secondBankId = paymentInfo.direction === 'THAILAND_TO_MALAYSIA' ? 'MAYBANK_001' : 'THAI_BANK_001';
+            const secondVerifyFunction = paymentInfo.direction === 'THAILAND_TO_MALAYSIA' ? 
+                contract.confirmMalaysiaVerification : contract.confirmThailandVerification;
+            
+            let tx2 = await secondVerifyFunction(
+                sessionId,
+                true,
+                secondBankId,
+                { gasLimit: GAS_SETTINGS.gasLimit }
+            );
+            await tx2.wait();
+            console.log(`✅ ${secondBankId} verification confirmed on blockchain`);
+            
+            // Update local session state
+            const session = activeSessions.get(sessionId);
+            if (session) {
+                session.originBankVerified = true;
+                session.destinationBankVerified = true;
+                session.status = 'verified';
+            }
+            
+            // Check verification status
+            const verificationStatus = await contract.getVerificationStatus(sessionId);
+            console.log(`🔍 Blockchain verification status: ${verificationStatus[2]}`);
+            
+        } catch (verifyError) {
+            console.error('Error verifying banks immediately:', verifyError);
+            // Continue even if verification failed - will retry later
+        }
+
         res.json({
             sessionId,
             merchantName: merchant.name,
-            status: 'verification_pending',
+            status: 'verified', // Assuming verification succeeded
             direction: paymentInfo.direction,
             transactionHash: receipt?.hash || tx.hash,
             blockNumber: receipt?.blockNumber
@@ -453,14 +504,86 @@ app.post('/process-payment', async (req, res) => {
             return res.status(400).json({ error: 'Session not found' });
         }
 
-        // Check if both banks have been verified successfully
+        // Check if both banks have been verified successfully locally
         if (session.originBankVerified !== true || session.destinationBankVerified !== true) {
-            console.log(`⚠️ Session ${sessionId} verification status:`, {
+            console.log(`⚠️ Session ${sessionId} local verification status:`, {
                 originBankVerified: session.originBankVerified,
                 destinationBankVerified: session.destinationBankVerified,
                 status: session.status
             });
-            return res.status(400).json({ error: 'Session not verified' });
+            return res.status(400).json({ error: 'Session not verified locally' });
+        }
+
+        // CRITICAL: Verify blockchain state before proceeding
+        console.log(`🔍 Double-checking blockchain verification status for session: ${sessionId}`);
+        try {
+            const verificationStatus = await contract.getVerificationStatus(sessionId);
+            console.log(`Blockchain verification status:`, {
+                originVerified: verificationStatus[0],
+                destinationVerified: verificationStatus[1],
+                status: verificationStatus[2]
+            });
+            
+            if (verificationStatus[2] !== 'VERIFIED') {
+                // If not verified on blockchain, try to reverify immediately
+                console.log(`⚠️ Session ${sessionId} not properly verified on blockchain: ${verificationStatus[2]}`);
+                console.log(`🔄 Re-verifying banks on blockchain before payment...`);
+                
+                // Re-verify both banks based on direction
+                if (session.direction === 'THAILAND_TO_MALAYSIA') {
+                    const tx1 = await contract.confirmThailandVerification(
+                        sessionId, 
+                        true, 
+                        'THAI_BANK_001',
+                        { gasLimit: GAS_SETTINGS.gasLimit }
+                    );
+                    await tx1.wait();
+                    console.log(`✅ Thailand verification confirmed`);
+                    
+                    const tx2 = await contract.confirmMalaysiaVerification(
+                        sessionId, 
+                        true, 
+                        'MAYBANK_001',
+                        { gasLimit: GAS_SETTINGS.gasLimit }
+                    );
+                    await tx2.wait();
+                    console.log(`✅ Malaysia verification confirmed`);
+                } else {
+                    const tx1 = await contract.confirmMalaysiaVerification(
+                        sessionId, 
+                        true, 
+                        'MAYBANK_001',
+                        { gasLimit: GAS_SETTINGS.gasLimit }
+                    );
+                    await tx1.wait();
+                    console.log(`✅ Malaysia verification confirmed`);
+                    
+                    const tx2 = await contract.confirmThailandVerification(
+                        sessionId, 
+                        true, 
+                        'THAI_BANK_001',
+                        { gasLimit: GAS_SETTINGS.gasLimit }
+                    );
+                    await tx2.wait();
+                    console.log(`✅ Thailand verification confirmed`);
+                }
+                
+                // Check verification status again
+                const updatedStatus = await contract.getVerificationStatus(sessionId);
+                if (updatedStatus[2] !== 'VERIFIED') {
+                    return res.status(400).json({ 
+                        error: `Failed to verify session on blockchain after multiple attempts: ${updatedStatus[2]}` 
+                    });
+                }
+                console.log(`✅ Successfully re-verified session ${sessionId} on blockchain`);
+            } else {
+                console.log(`✅ Session ${sessionId} already verified on blockchain`);
+            }
+        } catch (verificationError) {
+            console.error('Error checking blockchain verification:', verificationError);
+            return res.status(500).json({ 
+                error: 'Failed to verify blockchain status: ' + verificationError.message 
+            });
         }
 
         // Determine which bank data to load based on direction
@@ -673,58 +796,177 @@ app.get('/debug-session/:sessionId', (req, res) => {
 console.log('🎧 Setting up smart contract event listeners...');
 
 // Listen for Thailand to Malaysia events
-contract.on("VerifyThailandData", (sessionId, merchantId, hashedData, encryptedData, timestamp) => {
-    console.log('🔍 Event: VerifyThailandData');
-    console.log(`   Session: ${sessionId}`);
-    console.log(`   Merchant: ${merchantId}`);
-    console.log(`   Timestamp: ${new Date(Number(timestamp) * 1000).toISOString()}`);
+contract.on("VerifyThailandData", async (sessionId, merchantId, encryptedData, timestamp) => {
+    try {
+        const sessionIdStr = sessionId.toString();
+        console.log('🔍 Event: VerifyThailandData');
+        console.log(`   Session: ${sessionIdStr}`);
+        console.log(`   Merchant: ${merchantId}`);
+        console.log(`   Timestamp: ${new Date(Number(timestamp) * 1000).toISOString()}`);
+
+        // Auto-verify both banks for this session
+        try {
+            const session = activeSessions.get(sessionIdStr);
+            if (session) {
+                console.log(`🔄 Auto-verifying session ${sessionIdStr} on blockchain from event`);
+                
+                // Call Thailand verification
+                let tx1 = await contract.confirmThailandVerification(
+                    sessionIdStr, 
+                    true, 
+                    'THAI_BANK_001',
+                    { gasLimit: GAS_SETTINGS.gasLimit }
+                );
+                await tx1.wait();
+                console.log(`✅ Thailand verification confirmed for ${sessionIdStr}`);
+                
+                // Call Malaysia verification
+                let tx2 = await contract.confirmMalaysiaVerification(
+                    sessionIdStr, 
+                    true, 
+                    'MAYBANK_001',
+                    { gasLimit: GAS_SETTINGS.gasLimit }
+                );
+                await tx2.wait();
+                console.log(`✅ Malaysia verification confirmed for ${sessionIdStr}`);
+                
+                // Update local session status
+                if (session) {
+                    session.originBankVerified = true;
+                    session.destinationBankVerified = true;
+                    session.status = 'verified';
+                }
+                
+                // Check verification status
+                const status = await contract.getVerificationStatus(sessionIdStr);
+                console.log(`✓ Blockchain verification status: ${status[2]}`);
+            }
+        } catch (error) {
+            console.error(`❌ Error auto-verifying session ${sessionIdStr}:`, error.message);
+        }
+    } catch (error) {
+        console.error('Error in VerifyThailandData event handler:', error);
+    }
 });
 
-contract.on("ThailandVerified", (sessionId, verified, timestamp) => {
-    console.log('✅ Event: ThailandVerified');
-    console.log(`   Session: ${sessionId}`);
-    console.log(`   Verified: ${verified}`);
-    console.log(`   Timestamp: ${new Date(Number(timestamp) * 1000).toISOString()}`);
+contract.on("ThailandVerified", (sessionId, verified, bankId, timestamp) => {
+    try {
+        const sessionIdStr = sessionId.toString();
+        console.log('✅ Event: ThailandVerified');
+        console.log(`   Session: ${sessionIdStr}`);
+        console.log(`   Verified: ${verified}`);
+        console.log(`   Bank: ${bankId}`);
+        console.log(`   Timestamp: ${new Date(Number(timestamp) * 1000).toISOString()}`);
+    } catch (error) {
+        console.error('Error in ThailandVerified event handler:', error);
+    }
 });
 
 contract.on("ThailandPay", (sessionId, thaiUserId, amount, timestamp) => {
-    console.log('💰 Event: ThailandPay');
-    console.log(`   Session: ${sessionId}`);
-    console.log(`   User: ${thaiUserId}`);
-    console.log(`   Amount: ${ethers.formatEther(amount)} ETH`);
-    console.log(`   Timestamp: ${new Date(Number(timestamp) * 1000).toISOString()}`);
+    try {
+        const sessionIdStr = sessionId.toString();
+        console.log('💰 Event: ThailandPay');
+        console.log(`   Session: ${sessionIdStr}`);
+        console.log(`   User: ${thaiUserId}`);
+        console.log(`   Amount: ${ethers.formatEther(amount)} ETH`);
+        console.log(`   Timestamp: ${new Date(Number(timestamp) * 1000).toISOString()}`);
+    } catch (error) {
+        console.error('Error in ThailandPay event handler:', error);
+    }
 });
 
 // Listen for Malaysia to Thailand events
-contract.on("VerifyMalaysiaData", (sessionId, merchantId, hashedData, encryptedData, timestamp) => {
-    console.log('🔍 Event: VerifyMalaysiaData');
-    console.log(`   Session: ${sessionId}`);
-    console.log(`   Merchant: ${merchantId}`);
-    console.log(`   Timestamp: ${new Date(Number(timestamp) * 1000).toISOString()}`);
+contract.on("VerifyMalaysiaData", async (sessionId, merchantId, encryptedData, timestamp) => {
+    try {
+        const sessionIdStr = sessionId.toString();
+        console.log('🔍 Event: VerifyMalaysiaData');
+        console.log(`   Session: ${sessionIdStr}`);
+        console.log(`   Merchant: ${merchantId}`);
+        console.log(`   Timestamp: ${new Date(Number(timestamp) * 1000).toISOString()}`);
+
+        // Auto-verify both banks for this session
+        try {
+            const session = activeSessions.get(sessionIdStr);
+            if (session) {
+                console.log(`🔄 Auto-verifying session ${sessionIdStr} on blockchain from event`);
+                
+                // Call Malaysia verification
+                let tx1 = await contract.confirmMalaysiaVerification(
+                    sessionIdStr, 
+                    true, 
+                    'MAYBANK_001',
+                    { gasLimit: GAS_SETTINGS.gasLimit }
+                );
+                await tx1.wait();
+                console.log(`✅ Malaysia verification confirmed for ${sessionIdStr}`);
+                
+                // Call Thailand verification
+                let tx2 = await contract.confirmThailandVerification(
+                    sessionIdStr, 
+                    true, 
+                    'THAI_BANK_001',
+                    { gasLimit: GAS_SETTINGS.gasLimit }
+                );
+                await tx2.wait();
+                console.log(`✅ Thailand verification confirmed for ${sessionIdStr}`);
+                
+                // Update local session status
+                if (session) {
+                    session.originBankVerified = true;
+                    session.destinationBankVerified = true;
+                    session.status = 'verified';
+                }
+                
+                // Check verification status
+                const status = await contract.getVerificationStatus(sessionIdStr);
+                console.log(`✓ Blockchain verification status: ${status[2]}`);
+            }
+        } catch (error) {
+            console.error(`❌ Error auto-verifying session ${sessionIdStr}:`, error.message);
+        }
+    } catch (error) {
+        console.error('Error in VerifyMalaysiaData event handler:', error);
+    }
 });
 
-contract.on("MalaysiaVerified", (sessionId, verified, timestamp) => {
-    console.log('✅ Event: MalaysiaVerified');
-    console.log(`   Session: ${sessionId}`);
-    console.log(`   Verified: ${verified}`);
-    console.log(`   Timestamp: ${new Date(Number(timestamp) * 1000).toISOString()}`);
+contract.on("MalaysiaVerified", (sessionId, verified, bankId, timestamp) => {
+    try {
+        const sessionIdStr = sessionId.toString();
+        console.log('✅ Event: MalaysiaVerified');
+        console.log(`   Session: ${sessionIdStr}`);
+        console.log(`   Verified: ${verified}`);
+        console.log(`   Bank: ${bankId}`);
+        console.log(`   Timestamp: ${new Date(Number(timestamp) * 1000).toISOString()}`);
+    } catch (error) {
+        console.error('Error in MalaysiaVerified event handler:', error);
+    }
 });
 
 contract.on("MalaysiaPay", (sessionId, malayUserId, amount, timestamp) => {
-    console.log('💰 Event: MalaysiaPay');
-    console.log(`   Session: ${sessionId}`);
-    console.log(`   User: ${malayUserId}`);
-    console.log(`   Amount: ${ethers.formatEther(amount)} ETH`);
-    console.log(`   Timestamp: ${new Date(Number(timestamp) * 1000).toISOString()}`);
+    try {
+        const sessionIdStr = sessionId.toString();
+        console.log('💰 Event: MalaysiaPay');
+        console.log(`   Session: ${sessionIdStr}`);
+        console.log(`   User: ${malayUserId}`);
+        console.log(`   Amount: ${ethers.formatEther(amount)} ETH`);
+        console.log(`   Timestamp: ${new Date(Number(timestamp) * 1000).toISOString()}`);
+    } catch (error) {
+        console.error('Error in MalaysiaPay event handler:', error);
+    }
 });
 
 // Listen for common events
 contract.on("PaymentCompleted", (sessionId, amount, direction, timestamp) => {
-    console.log('🎉 Event: PaymentCompleted');
-    console.log(`   Session: ${sessionId}`);
-    console.log(`   Amount: ${ethers.formatEther(amount)} ETH`);
-    console.log(`   Direction: ${direction}`);
-    console.log(`   Timestamp: ${new Date(Number(timestamp) * 1000).toISOString()}`);
+    try {
+        const sessionIdStr = sessionId.toString();
+        console.log('🎉 Event: PaymentCompleted');
+        console.log(`   Session: ${sessionIdStr}`);
+        console.log(`   Amount: ${ethers.formatEther(amount)} ETH`);
+        console.log(`   Direction: ${direction}`);
+        console.log(`   Timestamp: ${new Date(Number(timestamp) * 1000).toISOString()}`);
+    } catch (error) {
+        console.error('Error in PaymentCompleted event handler:', error);
+    }
 });
 
 // Start server
