@@ -10,7 +10,7 @@ app.use(cors());
 app.use(express.json());
 
 // Load the real contract ABI and configuration
-const contractABI = require('../contract/abi.json');
+const contractABI = require('./contract/abi.json');
 const config = require('./config');
 
 // Contract configuration from config file
