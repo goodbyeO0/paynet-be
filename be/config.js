@@ -3,7 +3,7 @@
 
 module.exports = {
     // Your deployed smart contract address
-    CONTRACT_ADDRESS: "",
+    CONTRACT_ADDRESS: "0xe7E64f18F2345427d588e3fca0d6340b91047ebF",
 
     // Your wallet private key (the one that deployed the contract)
     // ⚠️ NEVER commit real private keys to version control!
@@ -14,8 +14,8 @@ module.exports = {
 
     // Network information
     NETWORK: {
-        name: "Sepolia Testnet",
-        chainId: 11155111,
+        name: "base",
+        chainId: 84532,
         currency: "ETH"
     },
 
